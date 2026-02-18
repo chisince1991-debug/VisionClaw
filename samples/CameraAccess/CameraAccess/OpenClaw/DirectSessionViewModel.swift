@@ -139,8 +139,22 @@ class DirectSessionViewModel: ObservableObject {
     
     let audioSession = AVAudioSession.sharedInstance()
     do {
-      try audioSession.setCategory(.playAndRecord, mode: .measurement, options: [.duckOthers, .defaultToSpeaker])
+      // Use .allowBluetooth + .allowBluetoothA2DP so we can capture from Ray-Ban glasses mic
+      // Use .defaultToSpeaker so TTS plays from phone speaker (not glasses)
+      // Note: .measurement mode gives best speech recognition accuracy
+      try audioSession.setCategory(
+        .playAndRecord,
+        mode: .measurement,
+        options: [.duckOthers, .defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP]
+      )
       try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+      log("🔊 Audio session configured (bluetooth: enabled, mode: measurement)")
+      
+      // Log current audio route for debugging
+      let route = audioSession.currentRoute
+      let inputs = route.inputs.map { "\($0.portName) (\($0.portType.rawValue))" }.joined(separator: ", ")
+      let outputs = route.outputs.map { "\($0.portName) (\($0.portType.rawValue))" }.joined(separator: ", ")
+      log("🔊 Audio route — IN: [\(inputs)] OUT: [\(outputs)]")
     } catch {
       errorMessage = "音訊設定失敗: \(error.localizedDescription)"
       state = .error("音訊設定失敗")
@@ -157,13 +171,24 @@ class DirectSessionViewModel: ObservableObject {
     }
     recognitionRequest.shouldReportPartialResults = true
     
-    let inputNode = audioEngine.inputNode
+    // Access inputNode — this can throw/crash if no mic input is available (e.g. bluetooth disconnect)
+    let inputNode: AVAudioInputNode
+    do {
+      inputNode = audioEngine.inputNode
+    } catch {
+      errorMessage = "無法取得麥克風輸入，請確認眼鏡已連接或手機麥克風可用"
+      state = .error("麥克風不可用")
+      log("❌ audioEngine.inputNode failed: \(error)")
+      return
+    }
+    
     let recordingFormat = inputNode.outputFormat(forBus: 0)
+    log("🎤 Input format: \(Int(recordingFormat.sampleRate)) Hz, \(recordingFormat.channelCount) ch")
     
     guard recordingFormat.sampleRate > 0 else {
-      errorMessage = "無效的音訊格式 (sampleRate=0)，麥克風可能被其他 app 佔用"
+      errorMessage = "無效的音訊格式 (sampleRate=0)，麥克風可能被其他 app 佔用或藍牙裝置未連接"
       state = .error("音訊格式無效")
-      log("❌ Invalid recording format: sampleRate=\(recordingFormat.sampleRate)")
+      log("❌ Invalid recording format: sampleRate=\(recordingFormat.sampleRate), channels=\(recordingFormat.channelCount)")
       return
     }
     
@@ -176,11 +201,12 @@ class DirectSessionViewModel: ObservableObject {
       try audioEngine.start()
       state = .listening
       transcript = ""
-      log("🎤 Listening (format: \(Int(recordingFormat.sampleRate)) Hz)")
+      log("🎤 Listening (\(Int(recordingFormat.sampleRate)) Hz, \(recordingFormat.channelCount) ch)")
     } catch {
-      errorMessage = "麥克風啟動失敗: \(error.localizedDescription)"
+      let nsError = error as NSError
+      errorMessage = "麥克風啟動失敗 [\(nsError.code)]: \(error.localizedDescription)"
       state = .error("麥克風啟動失敗")
-      log("❌ AudioEngine.start() error: \(error)")
+      log("❌ AudioEngine.start() error [\(nsError.domain) \(nsError.code)]: \(error)")
       inputNode.removeTap(onBus: 0)
       return
     }
@@ -303,7 +329,8 @@ class DirectSessionViewModel: ObservableObject {
     
     let audioSession = AVAudioSession.sharedInstance()
     do {
-      try audioSession.setCategory(.playback, mode: .default)
+      // Switch to playback for TTS — keep bluetooth so audio goes to glasses speaker if connected
+      try audioSession.setCategory(.playback, mode: .default, options: [.allowBluetooth, .allowBluetoothA2DP])
       try audioSession.setActive(true)
     } catch {
       log("⚠️ TTS audio session error: \(error.localizedDescription)")
