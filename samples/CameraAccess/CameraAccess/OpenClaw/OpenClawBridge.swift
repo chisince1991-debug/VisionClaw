@@ -1,4 +1,5 @@
 import Foundation
+import UIKit
 
 enum OpenClawConnectionState: Equatable {
   case notConfigured
@@ -15,7 +16,7 @@ class OpenClawBridge: ObservableObject {
   private let session: URLSession
   private let pingSession: URLSession
   private var sessionKey: String
-  private var conversationHistory: [[String: String]] = []
+  private var conversationHistory: [[String: Any]] = []
   private let maxHistoryTurns = 10
 
   init() {
@@ -72,7 +73,8 @@ class OpenClawBridge: ObservableObject {
 
   func delegateTask(
     task: String,
-    toolName: String = "execute"
+    toolName: String = "execute",
+    image: UIImage? = nil
   ) async -> ToolResult {
     lastToolCallStatus = .executing(toolName)
 
@@ -81,8 +83,22 @@ class OpenClawBridge: ObservableObject {
       return .failure("Invalid gateway URL")
     }
 
+    // Build message content - multimodal if image provided
+    let messageContent: Any
+    if let image = image, let jpegData = image.jpegData(compressionQuality: 0.8) {
+      let base64 = jpegData.base64EncodedString()
+      // OpenAI-compatible multimodal format
+      messageContent = [
+        ["type": "text", "text": task],
+        ["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(base64)"]]
+      ]
+      NSLog("[OpenClaw] Including image (%d bytes) with task", jpegData.count)
+    } else {
+      messageContent = task
+    }
+
     // Append the new user message to conversation history
-    conversationHistory.append(["role": "user", "content": task])
+    conversationHistory.append(["role": "user", "content": messageContent])
 
     // Trim history to keep only the most recent turns (user+assistant pairs)
     if conversationHistory.count > maxHistoryTurns * 2 {
@@ -101,7 +117,7 @@ class OpenClawBridge: ObservableObject {
       "stream": false
     ]
 
-    NSLog("[OpenClaw] Sending %d messages in conversation", conversationHistory.count)
+    NSLog("[OpenClaw] Sending %d messages in conversation (image: %@)", conversationHistory.count, image != nil ? "yes" : "no")
 
     do {
       request.httpBody = try JSONSerialization.data(withJSONObject: body)

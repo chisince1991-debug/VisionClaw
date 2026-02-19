@@ -1,9 +1,13 @@
 import Foundation
+import UIKit
 
 @MainActor
 class ToolCallRouter {
   private let bridge: OpenClawBridge
   private var inFlightTasks: [String: Task<Void, Never>] = [:]
+  
+  /// Current frame from glasses - set by GeminiSessionViewModel before tool calls
+  var currentFrame: UIImage?
 
   init(bridge: OpenClawBridge) {
     self.bridge = bridge
@@ -11,6 +15,7 @@ class ToolCallRouter {
 
   /// Route a tool call from Gemini to OpenClaw. Calls sendResponse with the
   /// JSON dictionary to send back as a toolResponse message.
+  /// Automatically includes currentFrame if the task involves images/vision.
   func handleToolCall(
     _ call: GeminiFunctionCall,
     sendResponse: @escaping ([String: Any]) -> Void
@@ -21,9 +26,21 @@ class ToolCallRouter {
     NSLog("[ToolCall] Received: %@ (id: %@) args: %@",
           callName, callId, String(describing: call.args))
 
+    // Capture current frame for this tool call
+    let frameForTask = self.currentFrame
+    
+    if let frame = frameForTask {
+      NSLog("[ToolCall] ✅ Has currentFrame: %dx%d", Int(frame.size.width), Int(frame.size.height))
+    } else {
+      NSLog("[ToolCall] ❌ No currentFrame available!")
+    }
+
     let task = Task { @MainActor in
       let taskDesc = call.args["task"] as? String ?? String(describing: call.args)
-      let result = await bridge.delegateTask(task: taskDesc, toolName: callName)
+      
+      // Include image if we have a current frame (glasses are streaming)
+      NSLog("[ToolCall] Delegating to OpenClaw with image: %@", frameForTask != nil ? "YES" : "NO")
+      let result = await bridge.delegateTask(task: taskDesc, toolName: callName, image: frameForTask)
 
       guard !Task.isCancelled else {
         NSLog("[ToolCall] Task %@ was cancelled, skipping response", callId)

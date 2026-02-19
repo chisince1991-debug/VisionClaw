@@ -183,6 +183,10 @@ class GeminiSessionViewModel: ObservableObject {
     guard now.timeIntervalSince(lastVideoFrameTime) >= GeminiConfig.videoFrameInterval else { return }
     lastVideoFrameTime = now
     geminiService.sendVideoFrame(image: image)
+    
+    // Keep current frame available for tool calls to OpenClaw
+    toolCallRouter?.currentFrame = image
+    NSLog("[VisionClaw] 📸 Updated currentFrame: %dx%d", Int(image.size.width), Int(image.size.height))
   }
 
 }
