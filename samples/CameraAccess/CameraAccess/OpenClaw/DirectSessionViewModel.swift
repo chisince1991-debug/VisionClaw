@@ -139,16 +139,15 @@ class DirectSessionViewModel: ObservableObject {
     
     let audioSession = AVAudioSession.sharedInstance()
     do {
-      // Use .allowBluetooth + .allowBluetoothA2DP so we can capture from Ray-Ban glasses mic
-      // Use .defaultToSpeaker so TTS plays from phone speaker (not glasses)
-      // Note: .measurement mode gives best speech recognition accuracy
+      // Fixed category throughout app lifecycle to avoid IPC bug with AVSpeechSynthesizer
+      // Using .voiceChat mode instead of .measurement for better TTS compatibility
       try audioSession.setCategory(
         .playAndRecord,
-        mode: .measurement,
-        options: [.duckOthers, .defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP]
+        mode: .voiceChat,
+        options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP]
       )
       try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
-      log("🔊 Audio session configured (bluetooth: enabled, mode: measurement)")
+      log("🔊 Audio session configured (bluetooth: enabled, mode: voiceChat)")
       
       // Log current audio route for debugging
       let route = audioSession.currentRoute
@@ -318,42 +317,217 @@ class DirectSessionViewModel: ObservableObject {
     }
   }
   
-  // MARK: - Voice Output (TTS)
+  // MARK: - Voice Output (MiniMax TTS primary, ElevenLabs fallback)
+  
+  private var ttsPlayer: AVAudioPlayer?
+  
+  // MiniMax TTS config
+  private let minimaxAPIKey = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJHcm91cE5hbWUiOiJMb3VpcyIsIlVzZXJOYW1lIjoiTG91aXMiLCJBY2NvdW50IjoiIiwiU3ViamVjdCI6IjE4NDQ2MTE3MDU4NzA4MDUwMjUiLCJQaG9uZSI6IiIsIkdyb3VwSWQiOiIyMDIzNjI5MDg2NDY2NzczNDYyIiwiUGFnZU5hbWUiOiIiLCJNYWlsIjoiIiwiQ3JlYXRlVGltZSI6IjIwMjUtMDItMTcgMDQ6NTU6NDEiLCJUb2tlblR5cGUiOjEsImlzcyI6Im1pbmltYXgifQ.gT2LHXBR5TGkGP_c-lbv7BF1EGcwJdpm6_Y0PYaRSO6NrLp23Oz4g7VHVoXMpfJoNNv_g8SJQzp3lnWGY2xH87MFBTBf2-XQDZt0eC7wr8P1FqCL07MLCXSQ_c0TGQWxUh7-HNMsZ1VBiWKF45p7xrpQZ1tNJAsnxqyBE4MQ1ZXgdqjCfRPVFk6kk8xnlNKW15fKcU32fGPcMDGU3T1RTg3EIzRf2B-LGpGiVfz0Rl0gz8jVblVNAZUGJsMWTLNI7rfGKcaAnmOWYCuG1rkNi4aLPqEwjgaORBk8sj5ZRzQRxd2fkgYvRLvX_dkVDSqXsOv8cXAcbahv6mXKKptAQ"
+  private let minimaxGroupId = "2023629086466773462"
+  
+  // ElevenLabs fallback config
+  private let elevenLabsAPIKey = "sk_a0442cbdb834f7b0a49427905be053e3f2ddac4055ec2cf1"
+  private let elevenLabsVoiceId = "pFZP5JQG7iQjIQuC4Bku"
   
   private func speak(_ text: String) async {
     state = .speaking
+    log("🔊 TTS starting: \"\(String(text.prefix(80)))...\"")
     
-    let utterance = AVSpeechUtterance(string: text)
-    utterance.voice = AVSpeechSynthesisVoice(language: "zh-TW")
-    utterance.rate = AVSpeechUtteranceDefaultSpeechRate * 1.1
+    // Truncate very long responses
+    let spokenText = text.count > 500 ? String(text.prefix(500)) + "。後面還有更多內容" : text
     
+    // Strip markdown formatting for cleaner speech
+    let cleanText = spokenText
+      .replacingOccurrences(of: "**", with: "")
+      .replacingOccurrences(of: "*", with: "")
+      .replacingOccurrences(of: "##", with: "")
+      .replacingOccurrences(of: "#", with: "")
+      .replacingOccurrences(of: "- ", with: "")
+      .replacingOccurrences(of: "`", with: "")
+    
+    // Set up audio session for playback (keep .playAndRecord to minimize switching)
     let audioSession = AVAudioSession.sharedInstance()
     do {
-      // Switch to playback for TTS — keep bluetooth so audio goes to glasses speaker if connected
-      try audioSession.setCategory(.playback, mode: .default, options: [.allowBluetooth, .allowBluetoothA2DP])
-      try audioSession.setActive(true)
-    } catch {
-      log("⚠️ TTS audio session error: \(error.localizedDescription)")
-    }
-    
-    synthesizer.speak(utterance)
-    
-    while synthesizer.isSpeaking {
+      try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
       try? await Task.sleep(nanoseconds: 100_000_000)
+      try audioSession.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
+      try audioSession.setActive(true)
+      log("🔊 Audio session: playAndRecord + defaultToSpeaker")
+    } catch {
+      log("⚠️ Audio session error: \(error.localizedDescription)")
     }
     
-    log("🔊 Finished speaking")
+    // Try MiniMax first, fallback to ElevenLabs
+    var audioData = await minimaxTTS(text: cleanText)
     
-    // Clear transcript for next round
+    if audioData == nil {
+      log("⚠️ MiniMax TTS failed, trying ElevenLabs fallback...")
+      audioData = await elevenLabsTTS(text: cleanText)
+    }
+    
+    if let audioData = audioData {
+      do {
+        ttsPlayer = try AVAudioPlayer(data: audioData)
+        ttsPlayer?.volume = 1.0
+        ttsPlayer?.prepareToPlay()
+        ttsPlayer?.play()
+        
+        while ttsPlayer?.isPlaying == true {
+          try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        log("🔊 Finished playing audio")
+      } catch {
+        log("❌ AVAudioPlayer error: \(error.localizedDescription)")
+      }
+    } else {
+      log("❌ All TTS methods failed")
+    }
+    
+    log("🔊 Finished speaking (\(cleanText.count) chars)")
     transcript = ""
     
-    // Auto-restart listening if in auto mode
     if isAutoMode {
-      // Small delay before restarting
-      try? await Task.sleep(nanoseconds: 300_000_000) // 300ms
+      try? await Task.sleep(nanoseconds: 800_000_000)
       startListening()
     } else {
       state = .idle
+    }
+  }
+  
+  // MARK: - MiniMax TTS (primary — best Chinese quality)
+  
+  private func minimaxTTS(text: String) async -> Data? {
+    guard let url = URL(string: "https://api.minimax.chat/v1/t2a_v2?GroupId=\(minimaxGroupId)") else {
+      log("❌ MiniMax: invalid URL")
+      return nil
+    }
+    
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue("Bearer \(minimaxAPIKey)", forHTTPHeaderField: "Authorization")
+    request.timeoutInterval = 15
+    
+    let body: [String: Any] = [
+      "model": "speech-02-turbo",
+      "text": text,
+      "voice_setting": [
+        "voice_id": "Chinese_Female_Shaonv",
+        "speed": 1.1,
+        "vol": 1.0,
+        "pitch": 0
+      ],
+      "audio_setting": [
+        "sample_rate": 32000,
+        "bitrate": 128000,
+        "format": "mp3"
+      ]
+    ]
+    
+    do {
+      request.httpBody = try JSONSerialization.data(withJSONObject: body)
+    } catch {
+      log("❌ MiniMax: JSON error: \(error.localizedDescription)")
+      return nil
+    }
+    
+    log("🔊 Calling MiniMax TTS...")
+    
+    do {
+      let (data, response) = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(Data, URLResponse), Error>) in
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+          if let error = error { cont.resume(throwing: error); return }
+          guard let data = data, let response = response else {
+            cont.resume(throwing: URLError(.badServerResponse)); return
+          }
+          cont.resume(returning: (data, response))
+        }
+        task.resume()
+      }
+      
+      guard let httpResponse = response as? HTTPURLResponse else {
+        log("❌ MiniMax: no HTTP response")
+        return nil
+      }
+      
+      log("🔊 MiniMax response: HTTP \(httpResponse.statusCode), \(data.count) bytes")
+      
+      guard httpResponse.statusCode == 200 else {
+        let bodyStr = String(data: data, encoding: .utf8) ?? "no body"
+        log("❌ MiniMax error: HTTP \(httpResponse.statusCode) - \(String(bodyStr.prefix(200)))")
+        return nil
+      }
+      
+      // MiniMax returns JSON with base64 audio: { "data": { "audio": "base64..." } }
+      if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+         let dataObj = json["data"] as? [String: Any],
+         let base64Audio = dataObj["audio"] as? String,
+         let audioData = Data(base64Encoded: base64Audio) {
+        log("🔊 MiniMax: decoded \(audioData.count) bytes audio")
+        return audioData
+      }
+      
+      // Some endpoints return raw audio
+      if data.count > 1000 {
+        return data
+      }
+      
+      log("❌ MiniMax: unexpected response format")
+      return nil
+    } catch {
+      log("❌ MiniMax network error: \(error.localizedDescription)")
+      return nil
+    }
+  }
+  
+  // MARK: - ElevenLabs TTS (fallback)
+  
+  private func elevenLabsTTS(text: String) async -> Data? {
+    guard let url = URL(string: "https://api.elevenlabs.io/v1/text-to-speech/\(elevenLabsVoiceId)") else {
+      return nil
+    }
+    
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.setValue(elevenLabsAPIKey, forHTTPHeaderField: "xi-api-key")
+    request.setValue("audio/mpeg", forHTTPHeaderField: "Accept")
+    request.timeoutInterval = 30
+    
+    let body: [String: Any] = [
+      "text": text,
+      "model_id": "eleven_flash_v2_5",
+      "voice_settings": [
+        "stability": 0.5,
+        "similarity_boost": 0.75
+      ]
+    ]
+    
+    do {
+      request.httpBody = try JSONSerialization.data(withJSONObject: body)
+      log("🔊 Calling ElevenLabs API...")
+      
+      let (data, response) = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(Data, URLResponse), Error>) in
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+          if let error = error { cont.resume(throwing: error); return }
+          guard let data = data, let response = response else {
+            cont.resume(throwing: URLError(.badServerResponse)); return
+          }
+          cont.resume(returning: (data, response))
+        }
+        task.resume()
+      }
+      
+      if let httpResponse = response as? HTTPURLResponse {
+        log("🔊 ElevenLabs: HTTP \(httpResponse.statusCode), \(data.count) bytes")
+        if httpResponse.statusCode == 200 && data.count > 1000 {
+          return data
+        }
+      }
+      return nil
+    } catch {
+      log("❌ ElevenLabs error: \(error.localizedDescription)")
+      return nil
     }
   }
   

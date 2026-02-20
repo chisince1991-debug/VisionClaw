@@ -110,6 +110,7 @@ class OpenClawBridge: ObservableObject {
     request.setValue("Bearer \(GeminiConfig.openClawGatewayToken)", forHTTPHeaderField: "Authorization")
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.setValue(sessionKey, forHTTPHeaderField: "x-openclaw-session-key")
+    request.setValue("glass", forHTTPHeaderField: "x-openclaw-agent-id")
 
     let body: [String: Any] = [
       "model": "openclaw",
@@ -120,8 +121,23 @@ class OpenClawBridge: ObservableObject {
     NSLog("[OpenClaw] Sending %d messages in conversation (image: %@)", conversationHistory.count, image != nil ? "yes" : "no")
 
     do {
-      request.httpBody = try JSONSerialization.data(withJSONObject: body)
-      let (data, response) = try await session.data(for: request)
+      let jsonData = try JSONSerialization.data(withJSONObject: body)
+      request.httpBody = jsonData
+
+      // Use a detached task to prevent cancellation from caller's task tree
+      let (data, response) = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Data, URLResponse), Error>) in
+        let task = self.session.dataTask(with: request) { data, response, error in
+          if let error = error {
+            continuation.resume(throwing: error)
+          } else if let data = data, let response = response {
+            continuation.resume(returning: (data, response))
+          } else {
+            continuation.resume(throwing: NSError(domain: "OpenClaw", code: -1, userInfo: [NSLocalizedDescriptionKey: "No data/response"]))
+          }
+        }
+        task.resume()
+      }
+
       let httpResponse = response as? HTTPURLResponse
 
       guard let statusCode = httpResponse?.statusCode, (200...299).contains(statusCode) else {
