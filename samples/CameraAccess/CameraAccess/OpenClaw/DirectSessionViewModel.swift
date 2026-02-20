@@ -37,9 +37,13 @@ class DirectSessionViewModel: ObservableObject {
   /// Voice activity detection
   private var lastSpeechTime: Date = Date()
   private var silenceTimer: Task<Void, Never>?
-  private let silenceThreshold: TimeInterval = 1.5  // 1.5秒靜默後自動發送
+  private let silenceThreshold: TimeInterval = 1.0  // 1.0秒靜默後自動發送（從1.5s優化）
   private var hasDetectedSpeech: Bool = false
   private var isProcessingRequest: Bool = false  // 防止在處理中重新開始監聽
+  
+  /// Pre-emptive Gemini Vision: start analyzing frame as soon as speech detected
+  private var preemptiveVisionTask: Task<String?, Never>?
+  private var preemptiveVisionFrame: UIImage?
   
   // MARK: - Debug Logging
   
@@ -219,6 +223,17 @@ class DirectSessionViewModel: ObservableObject {
           if newTranscript != self.transcript && !newTranscript.isEmpty {
             self.log("📝 \"\(newTranscript)\"")
             self.transcript = newTranscript
+            
+            // Pre-emptive Vision: start Gemini analysis on FIRST speech detection
+            // By the time silence is detected (~1s later), vision result is already ready
+            if !self.hasDetectedSpeech, let frame = self.currentFrame {
+              self.log("📸 Pre-emptive Vision: capturing frame & starting Gemini analysis NOW")
+              self.preemptiveVisionFrame = frame
+              self.preemptiveVisionTask = Task {
+                await self.bridge.analyzeImageWithGeminiPublic(image: frame, userSpeech: newTranscript)
+              }
+            }
+            
             self.hasDetectedSpeech = true
             self.lastSpeechTime = Date()
             self.silenceTimer?.cancel()
@@ -286,15 +301,47 @@ class DirectSessionViewModel: ObservableObject {
     state = .processing
     isProcessingRequest = true
     
-    let frameToSend = currentFrame
-    log("📤 Sending to 小助理: \"\(finalTranscript)\" (image: \(frameToSend != nil ? "YES → Gemini Vision first" : "NO"))")
-    
     let startTime = Date()
-    let result = await bridge.delegateTask(
-      task: finalTranscript,
-      toolName: "voice",
-      image: frameToSend
-    )
+    
+    // Check if pre-emptive vision analysis is available (started when speech first detected)
+    var visionDescription: String? = nil
+    if let visionTask = preemptiveVisionTask {
+      log("📸 Waiting for pre-emptive Vision result...")
+      let preemptiveStart = Date()
+      visionDescription = await visionTask.value
+      let preemptiveWait = Date().timeIntervalSince(preemptiveStart)
+      if let desc = visionDescription {
+        log("📸 Pre-emptive Vision ready! (waited \(String(format: "%.1f", preemptiveWait))s, \(desc.count) chars)")
+      } else {
+        log("⚠️ Pre-emptive Vision failed (waited \(String(format: "%.1f", preemptiveWait))s)")
+      }
+    } else if currentFrame != nil {
+      // No pre-emptive task (e.g. speech was too short) — fall back to inline analysis
+      log("📸 No pre-emptive Vision, falling back to inline Gemini call")
+    }
+    
+    // Clean up pre-emptive state
+    preemptiveVisionTask = nil
+    preemptiveVisionFrame = nil
+    
+    let hasVision = visionDescription != nil || currentFrame != nil
+    log("📤 Sending to 小助理: \"\(finalTranscript)\" (vision: \(hasVision ? "YES" : "NO"), preemptive: \(visionDescription != nil ? "HIT" : "MISS"))")
+    
+    // If we have pre-emptive vision, pass it directly (skip Gemini call inside delegateTask)
+    let result: ToolResult
+    if let desc = visionDescription {
+      result = await bridge.delegateTaskWithVision(
+        task: finalTranscript,
+        visionDescription: desc,
+        toolName: "voice"
+      )
+    } else {
+      result = await bridge.delegateTask(
+        task: finalTranscript,
+        toolName: "voice",
+        image: currentFrame
+      )
+    }
     let elapsed = Date().timeIntervalSince(startTime)
     log("⏱️ Response in \(String(format: "%.1f", elapsed))s")
     
@@ -535,6 +582,9 @@ class DirectSessionViewModel: ObservableObject {
   func cleanup() {
     silenceTimer?.cancel()
     silenceTimer = nil
+    preemptiveVisionTask?.cancel()
+    preemptiveVisionTask = nil
+    preemptiveVisionFrame = nil
     audioEngine.stop()
     audioEngine.inputNode.removeTap(onBus: 0)
     recognitionTask?.cancel()

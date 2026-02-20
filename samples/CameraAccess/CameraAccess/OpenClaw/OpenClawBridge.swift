@@ -78,11 +78,51 @@ class OpenClawBridge: ObservableObject {
   //
   // This bypasses the gateway's lack of inline base64 image support.
 
+  /// Delegate task with pre-computed vision description (skips Gemini call — used with pre-emptive vision)
+  func delegateTaskWithVision(
+    task: String,
+    visionDescription: String,
+    toolName: String = "execute"
+  ) async -> ToolResult {
+    let enrichedTask = """
+    [使用者透過眼鏡說]: \(task)
+    [眼鏡攝影機畫面分析]: \(visionDescription)
+    
+    請根據使用者說的話和眼前的畫面來回答。用簡短口語化的中文回覆（這會透過語音播放給使用者聽）。
+    """
+    NSLog("[OpenClaw] 📸 Using pre-emptive vision (%d chars), skipping inline Gemini call", visionDescription.count)
+    return await sendToGateway(enrichedTask: enrichedTask, toolName: toolName)
+  }
+  
   func delegateTask(
     task: String,
     toolName: String = "execute",
     image: UIImage? = nil
   ) async -> ToolResult {
+    // Step 1: If image provided, analyze with Gemini Vision first (sequential fallback)
+    var enrichedTask = task
+    if let image = image {
+      NSLog("[OpenClaw] 📸 Image provided — analyzing with Gemini Vision (inline)...")
+      let visionResult = await analyzeImageWithGemini(image: image, userSpeech: task)
+      if let description = visionResult {
+        enrichedTask = """
+        [使用者透過眼鏡說]: \(task)
+        [眼鏡攝影機畫面分析]: \(description)
+        
+        請根據使用者說的話和眼前的畫面來回答。用簡短口語化的中文回覆（這會透過語音播放給使用者聽）。
+        """
+        NSLog("[OpenClaw] 📸 Vision analysis done (%d chars)", description.count)
+      } else {
+        NSLog("[OpenClaw] ⚠️ Vision analysis failed, sending text-only")
+      }
+    }
+
+    return await sendToGateway(enrichedTask: enrichedTask, toolName: toolName)
+  }
+  
+  // MARK: - Gateway Communication (shared by delegateTask and delegateTaskWithVision)
+  
+  func sendToGateway(enrichedTask: String, toolName: String) async -> ToolResult {
     lastToolCallStatus = .executing(toolName)
 
     guard let url = URL(string: "\(GeminiConfig.openClawHost):\(GeminiConfig.openClawPort)/v1/chat/completions") else {
@@ -90,29 +130,8 @@ class OpenClawBridge: ObservableObject {
       return .failure("Invalid gateway URL")
     }
 
-    // Step 1: If image provided, analyze with Gemini Vision first
-    var enrichedTask = task
-    if let image = image {
-      NSLog("[OpenClaw] 📸 Image provided — analyzing with Gemini Vision first...")
-      let visionResult = await analyzeImageWithGemini(image: image, userSpeech: task)
-      if let description = visionResult {
-        // Combine vision analysis with user's speech for the OpenClaw agent
-        enrichedTask = """
-        [使用者透過眼鏡說]: \(task)
-        [眼鏡攝影機畫面分析]: \(description)
-        
-        請根據使用者說的話和眼前的畫面來回答。用簡短口語化的中文回覆（這會透過語音播放給使用者聽）。
-        """
-        NSLog("[OpenClaw] 📸 Vision analysis done (%d chars), sending enriched task", description.count)
-      } else {
-        NSLog("[OpenClaw] ⚠️ Vision analysis failed, sending text-only")
-      }
-    }
-
-    // Step 2: Send enriched text to OpenClaw gateway (text-only, no image)
     conversationHistory.append(["role": "user", "content": enrichedTask])
 
-    // Trim history to keep only the most recent turns
     if conversationHistory.count > maxHistoryTurns * 2 {
       conversationHistory = Array(conversationHistory.suffix(maxHistoryTurns * 2))
     }
@@ -130,7 +149,7 @@ class OpenClawBridge: ObservableObject {
       "stream": false
     ]
 
-    NSLog("[OpenClaw] Sending %d messages in conversation (vision-enriched: %@)", conversationHistory.count, image != nil ? "yes" : "no")
+    NSLog("[OpenClaw] Sending %d messages to gateway", conversationHistory.count)
 
     do {
       let jsonData = try JSONSerialization.data(withJSONObject: body)
@@ -183,6 +202,11 @@ class OpenClawBridge: ObservableObject {
   }
 
   // MARK: - Gemini Vision Analysis (direct API call, bypasses gateway)
+  
+  /// Public wrapper for pre-emptive vision analysis from ViewModel
+  func analyzeImageWithGeminiPublic(image: UIImage, userSpeech: String) async -> String? {
+    return await analyzeImageWithGemini(image: image, userSpeech: userSpeech)
+  }
   
   /// Sends an image + user speech to Gemini API for fast multimodal analysis.
   /// Returns a text description of what the camera sees, or nil on failure.
