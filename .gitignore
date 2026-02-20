@@ -1,1 +1,4 @@
 .DS_Store
+
+# Secret keys — never push to GitHub
+**/Secrets.swift

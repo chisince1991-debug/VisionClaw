@@ -321,13 +321,10 @@ class DirectSessionViewModel: ObservableObject {
   
   private var ttsPlayer: AVAudioPlayer?
   
-  // MiniMax TTS config
-  private let minimaxAPIKey = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJHcm91cE5hbWUiOiJMb3VpcyIsIlVzZXJOYW1lIjoiTG91aXMiLCJBY2NvdW50IjoiIiwiU3ViamVjdCI6IjE4NDQ2MTE3MDU4NzA4MDUwMjUiLCJQaG9uZSI6IiIsIkdyb3VwSWQiOiIyMDIzNjI5MDg2NDY2NzczNDYyIiwiUGFnZU5hbWUiOiIiLCJNYWlsIjoiIiwiQ3JlYXRlVGltZSI6IjIwMjUtMDItMTcgMDQ6NTU6NDEiLCJUb2tlblR5cGUiOjEsImlzcyI6Im1pbmltYXgifQ.gT2LHXBR5TGkGP_c-lbv7BF1EGcwJdpm6_Y0PYaRSO6NrLp23Oz4g7VHVoXMpfJoNNv_g8SJQzp3lnWGY2xH87MFBTBf2-XQDZt0eC7wr8P1FqCL07MLCXSQ_c0TGQWxUh7-HNMsZ1VBiWKF45p7xrpQZ1tNJAsnxqyBE4MQ1ZXgdqjCfRPVFk6kk8xnlNKW15fKcU32fGPcMDGU3T1RTg3EIzRf2B-LGpGiVfz0Rl0gz8jVblVNAZUGJsMWTLNI7rfGKcaAnmOWYCuG1rkNi4aLPqEwjgaORBk8sj5ZRzQRxd2fkgYvRLvX_dkVDSqXsOv8cXAcbahv6mXKKptAQ"
-  private let minimaxGroupId = "2023629086466773462"
-  
-  // ElevenLabs fallback config
-  private let elevenLabsAPIKey = "sk_a0442cbdb834f7b0a49427905be053e3f2ddac4055ec2cf1"
-  private let elevenLabsVoiceId = "pFZP5JQG7iQjIQuC4Bku"
+  // TTS keys from Secrets.swift (no hardcoded keys in this file)
+  private var openAIAPIKey: String { Secrets.openAIAPIKey }
+  private var elevenLabsAPIKey: String { Secrets.elevenLabsAPIKey }
+  private var elevenLabsVoiceId: String { Secrets.elevenLabsVoiceId }
   
   private func speak(_ text: String) async {
     state = .speaking
@@ -362,11 +359,11 @@ class DirectSessionViewModel: ObservableObject {
       log("⚠️ Audio session error: \(error.localizedDescription)")
     }
     
-    // Try MiniMax first, fallback to ElevenLabs
-    var audioData = await minimaxTTS(text: cleanText)
+    // Try OpenAI TTS first, fallback to ElevenLabs
+    var audioData = await openAITTS(text: cleanText)
     
     if audioData == nil {
-      log("⚠️ MiniMax TTS failed, trying ElevenLabs fallback...")
+      log("⚠️ OpenAI TTS failed, trying ElevenLabs fallback...")
       audioData = await elevenLabsTTS(text: cleanText)
     }
     
@@ -406,44 +403,36 @@ class DirectSessionViewModel: ObservableObject {
     }
   }
   
-  // MARK: - MiniMax TTS (primary — best Chinese quality)
+  // MARK: - OpenAI TTS (primary — stable, good Chinese)
   
-  private func minimaxTTS(text: String) async -> Data? {
-    guard let url = URL(string: "https://api.minimax.chat/v1/t2a_v2?GroupId=\(minimaxGroupId)") else {
-      log("❌ MiniMax: invalid URL")
+  private func openAITTS(text: String) async -> Data? {
+    guard let url = URL(string: "https://api.openai.com/v1/audio/speech") else {
+      log("❌ OpenAI TTS: invalid URL")
       return nil
     }
     
     var request = URLRequest(url: url)
     request.httpMethod = "POST"
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    request.setValue("Bearer \(minimaxAPIKey)", forHTTPHeaderField: "Authorization")
+    request.setValue("Bearer \(openAIAPIKey)", forHTTPHeaderField: "Authorization")
     request.timeoutInterval = 15
     
     let body: [String: Any] = [
-      "model": "speech-02-turbo",
-      "text": text,
-      "voice_setting": [
-        "voice_id": "Chinese_Female_Shaonv",
-        "speed": 1.1,
-        "vol": 1.0,
-        "pitch": 0
-      ],
-      "audio_setting": [
-        "sample_rate": 32000,
-        "bitrate": 128000,
-        "format": "mp3"
-      ]
+      "model": "tts-1",
+      "input": text,
+      "voice": "nova",
+      "response_format": "mp3",
+      "speed": 1.1
     ]
     
     do {
       request.httpBody = try JSONSerialization.data(withJSONObject: body)
     } catch {
-      log("❌ MiniMax: JSON error: \(error.localizedDescription)")
+      log("❌ OpenAI TTS: JSON error: \(error.localizedDescription)")
       return nil
     }
     
-    log("🔊 Calling MiniMax TTS...")
+    log("🔊 Calling OpenAI TTS...")
     
     do {
       let (data, response) = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(Data, URLResponse), Error>) in
@@ -458,36 +447,28 @@ class DirectSessionViewModel: ObservableObject {
       }
       
       guard let httpResponse = response as? HTTPURLResponse else {
-        log("❌ MiniMax: no HTTP response")
+        log("❌ OpenAI TTS: no HTTP response")
         return nil
       }
       
-      log("🔊 MiniMax response: HTTP \(httpResponse.statusCode), \(data.count) bytes")
+      log("🔊 OpenAI TTS response: HTTP \(httpResponse.statusCode), \(data.count) bytes")
       
       guard httpResponse.statusCode == 200 else {
         let bodyStr = String(data: data, encoding: .utf8) ?? "no body"
-        log("❌ MiniMax error: HTTP \(httpResponse.statusCode) - \(String(bodyStr.prefix(200)))")
+        log("❌ OpenAI TTS error: HTTP \(httpResponse.statusCode) - \(String(bodyStr.prefix(200)))")
         return nil
       }
       
-      // MiniMax returns JSON with base64 audio: { "data": { "audio": "base64..." } }
-      if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-         let dataObj = json["data"] as? [String: Any],
-         let base64Audio = dataObj["audio"] as? String,
-         let audioData = Data(base64Encoded: base64Audio) {
-        log("🔊 MiniMax: decoded \(audioData.count) bytes audio")
-        return audioData
-      }
-      
-      // Some endpoints return raw audio
-      if data.count > 1000 {
+      // OpenAI returns raw MP3 audio directly
+      if data.count > 100 {
+        log("🔊 OpenAI TTS: got \(data.count) bytes MP3 audio")
         return data
       }
       
-      log("❌ MiniMax: unexpected response format")
+      log("❌ OpenAI TTS: response too small (\(data.count) bytes)")
       return nil
     } catch {
-      log("❌ MiniMax network error: \(error.localizedDescription)")
+      log("❌ OpenAI TTS network error: \(error.localizedDescription)")
       return nil
     }
   }
