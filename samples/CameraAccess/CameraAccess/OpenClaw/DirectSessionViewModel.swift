@@ -345,14 +345,19 @@ class DirectSessionViewModel: ObservableObject {
       .replacingOccurrences(of: "- ", with: "")
       .replacingOccurrences(of: "`", with: "")
     
-    // Set up audio session for playback (keep .playAndRecord to minimize switching)
+    // Keep audio session consistent — DO NOT switch mode or deactivate/reactivate
+    // Switching mode triggers iOS IPC bug with AVSpeechSynthesizer (三方會診 2026-02-19 結論)
     let audioSession = AVAudioSession.sharedInstance()
     do {
-      try audioSession.setActive(false, options: .notifyOthersOnDeactivation)
-      try? await Task.sleep(nanoseconds: 100_000_000)
-      try audioSession.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
-      try audioSession.setActive(true)
-      log("🔊 Audio session: playAndRecord + defaultToSpeaker")
+      try audioSession.setCategory(
+        .playAndRecord,
+        mode: .voiceChat,
+        options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP]
+      )
+      if !audioSession.isOtherAudioPlaying {
+        try audioSession.setActive(true)
+      }
+      log("🔊 Audio session: playAndRecord + voiceChat (consistent, no switching)")
     } catch {
       log("⚠️ Audio session error: \(error.localizedDescription)")
     }
@@ -366,10 +371,17 @@ class DirectSessionViewModel: ObservableObject {
     }
     
     if let audioData = audioData {
+      log("🔊 Got audio data: \(audioData.count) bytes, first 4 bytes: \(audioData.prefix(4).map { String(format: "%02X", $0) }.joined())")
       do {
         ttsPlayer = try AVAudioPlayer(data: audioData)
         ttsPlayer?.volume = 1.0
         ttsPlayer?.prepareToPlay()
+        
+        // Log audio route before playing
+        let route = audioSession.currentRoute
+        let outputs = route.outputs.map { "\($0.portName) (\($0.portType.rawValue))" }.joined(separator: ", ")
+        log("🔊 Playing on: [\(outputs)], duration: \(String(format: "%.1f", ttsPlayer?.duration ?? 0))s")
+        
         ttsPlayer?.play()
         
         while ttsPlayer?.isPlaying == true {
@@ -380,7 +392,7 @@ class DirectSessionViewModel: ObservableObject {
         log("❌ AVAudioPlayer error: \(error.localizedDescription)")
       }
     } else {
-      log("❌ All TTS methods failed")
+      log("❌ All TTS methods failed — both MiniMax and ElevenLabs returned nil")
     }
     
     log("🔊 Finished speaking (\(cleanText.count) chars)")
