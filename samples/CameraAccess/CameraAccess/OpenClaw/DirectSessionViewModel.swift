@@ -287,7 +287,7 @@ class DirectSessionViewModel: ObservableObject {
     isProcessingRequest = true
     
     let frameToSend = currentFrame
-    log("📤 Sending to 小助理: \"\(finalTranscript)\" (image: \(frameToSend != nil ? "YES" : "NO"))")
+    log("📤 Sending to 小助理: \"\(finalTranscript)\" (image: \(frameToSend != nil ? "YES → Gemini Vision first" : "NO"))")
     
     let startTime = Date()
     let result = await bridge.delegateTask(

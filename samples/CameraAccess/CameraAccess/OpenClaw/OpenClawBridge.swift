@@ -70,6 +70,13 @@ class OpenClawBridge: ObservableObject {
   }
 
   // MARK: - Agent Chat (session continuity via x-openclaw-session-key header)
+  //
+  // Architecture for vision+voice:
+  //   1. If image provided → Gemini API analyzes it first (fast, free, native multimodal)
+  //   2. Image description + user's speech → sent as text to OpenClaw gateway
+  //   3. OpenClaw (glass agent) responds with context from both vision and conversation
+  //
+  // This bypasses the gateway's lack of inline base64 image support.
 
   func delegateTask(
     task: String,
@@ -83,24 +90,29 @@ class OpenClawBridge: ObservableObject {
       return .failure("Invalid gateway URL")
     }
 
-    // Build message content - multimodal if image provided
-    let messageContent: Any
-    if let image = image, let jpegData = image.jpegData(compressionQuality: 0.8) {
-      let base64 = jpegData.base64EncodedString()
-      // OpenAI-compatible multimodal format
-      messageContent = [
-        ["type": "text", "text": task],
-        ["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(base64)"]]
-      ]
-      NSLog("[OpenClaw] Including image (%d bytes) with task", jpegData.count)
-    } else {
-      messageContent = task
+    // Step 1: If image provided, analyze with Gemini Vision first
+    var enrichedTask = task
+    if let image = image {
+      NSLog("[OpenClaw] 📸 Image provided — analyzing with Gemini Vision first...")
+      let visionResult = await analyzeImageWithGemini(image: image, userSpeech: task)
+      if let description = visionResult {
+        // Combine vision analysis with user's speech for the OpenClaw agent
+        enrichedTask = """
+        [使用者透過眼鏡說]: \(task)
+        [眼鏡攝影機畫面分析]: \(description)
+        
+        請根據使用者說的話和眼前的畫面來回答。用簡短口語化的中文回覆（這會透過語音播放給使用者聽）。
+        """
+        NSLog("[OpenClaw] 📸 Vision analysis done (%d chars), sending enriched task", description.count)
+      } else {
+        NSLog("[OpenClaw] ⚠️ Vision analysis failed, sending text-only")
+      }
     }
 
-    // Append the new user message to conversation history
-    conversationHistory.append(["role": "user", "content": messageContent])
+    // Step 2: Send enriched text to OpenClaw gateway (text-only, no image)
+    conversationHistory.append(["role": "user", "content": enrichedTask])
 
-    // Trim history to keep only the most recent turns (user+assistant pairs)
+    // Trim history to keep only the most recent turns
     if conversationHistory.count > maxHistoryTurns * 2 {
       conversationHistory = Array(conversationHistory.suffix(maxHistoryTurns * 2))
     }
@@ -118,13 +130,12 @@ class OpenClawBridge: ObservableObject {
       "stream": false
     ]
 
-    NSLog("[OpenClaw] Sending %d messages in conversation (image: %@)", conversationHistory.count, image != nil ? "yes" : "no")
+    NSLog("[OpenClaw] Sending %d messages in conversation (vision-enriched: %@)", conversationHistory.count, image != nil ? "yes" : "no")
 
     do {
       let jsonData = try JSONSerialization.data(withJSONObject: body)
       request.httpBody = jsonData
 
-      // Use a detached task to prevent cancellation from caller's task tree
       let (data, response) = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<(Data, URLResponse), Error>) in
         let task = self.session.dataTask(with: request) { data, response, error in
           if let error = error {
@@ -153,7 +164,6 @@ class OpenClawBridge: ObservableObject {
          let first = choices.first,
          let message = first["message"] as? [String: Any],
          let content = message["content"] as? String {
-        // Append assistant response to history for continuity
         conversationHistory.append(["role": "assistant", "content": content])
         NSLog("[OpenClaw] Agent result: %@", String(content.prefix(200)))
         lastToolCallStatus = .completed(toolName)
@@ -169,6 +179,99 @@ class OpenClawBridge: ObservableObject {
       NSLog("[OpenClaw] Agent error: %@", error.localizedDescription)
       lastToolCallStatus = .failed(toolName, error.localizedDescription)
       return .failure("Agent error: \(error.localizedDescription)")
+    }
+  }
+
+  // MARK: - Gemini Vision Analysis (direct API call, bypasses gateway)
+  
+  /// Sends an image + user speech to Gemini API for fast multimodal analysis.
+  /// Returns a text description of what the camera sees, or nil on failure.
+  private func analyzeImageWithGemini(image: UIImage, userSpeech: String) async -> String? {
+    // Compress image for speed (lower quality = faster upload)
+    guard let jpegData = image.jpegData(compressionQuality: 0.5) else {
+      NSLog("[Gemini Vision] ❌ Failed to compress image")
+      return nil
+    }
+    
+    let base64Image = jpegData.base64EncodedString()
+    let apiKey = GeminiConfig.apiKey
+    
+    guard !apiKey.isEmpty else {
+      NSLog("[Gemini Vision] ❌ No Gemini API key configured")
+      return nil
+    }
+    
+    // Use gemini-2.0-flash for fast vision (free tier, fast response)
+    guard let url = URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=\(apiKey)") else {
+      return nil
+    }
+    
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.timeoutInterval = 10  // Fast timeout — this needs to be snappy for voice
+    
+    let body: [String: Any] = [
+      "contents": [[
+        "parts": [
+          ["text": """
+          使用者戴著智慧眼鏡，正在透過語音跟你對話。以下是他說的話和眼鏡攝影機看到的畫面。
+          
+          使用者說：「\(userSpeech)」
+          
+          請詳細描述畫面中看到的所有重要內容（物品、文字、人物、場景、顏色等），用中文回答。
+          如果畫面中有文字，請完整辨識出來。
+          簡潔但完整，不超過 200 字。
+          """],
+          ["inline_data": [
+            "mime_type": "image/jpeg",
+            "data": base64Image
+          ]]
+        ]
+      ]]
+    ]
+    
+    do {
+      request.httpBody = try JSONSerialization.data(withJSONObject: body)
+      
+      let (data, response) = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<(Data, URLResponse), Error>) in
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+          if let error = error { cont.resume(throwing: error); return }
+          guard let data = data, let response = response else {
+            cont.resume(throwing: URLError(.badServerResponse)); return
+          }
+          cont.resume(returning: (data, response))
+        }
+        task.resume()
+      }
+      
+      guard let httpResponse = response as? HTTPURLResponse else { return nil }
+      
+      NSLog("[Gemini Vision] Response: HTTP %d, %d bytes", httpResponse.statusCode, data.count)
+      
+      guard httpResponse.statusCode == 200 else {
+        let bodyStr = String(data: data, encoding: .utf8) ?? "no body"
+        NSLog("[Gemini Vision] ❌ Error: %@", String(bodyStr.prefix(300)))
+        return nil
+      }
+      
+      // Parse Gemini response: { "candidates": [{ "content": { "parts": [{ "text": "..." }] } }] }
+      if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+         let candidates = json["candidates"] as? [[String: Any]],
+         let first = candidates.first,
+         let content = first["content"] as? [String: Any],
+         let parts = content["parts"] as? [[String: Any]],
+         let textPart = parts.first,
+         let text = textPart["text"] as? String {
+        NSLog("[Gemini Vision] ✅ Got description: %@", String(text.prefix(100)))
+        return text
+      }
+      
+      NSLog("[Gemini Vision] ❌ Unexpected response format")
+      return nil
+    } catch {
+      NSLog("[Gemini Vision] ❌ Network error: %@", error.localizedDescription)
+      return nil
     }
   }
 }
