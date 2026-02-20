@@ -377,8 +377,8 @@ class DirectSessionViewModel: ObservableObject {
     state = .speaking
     log("🔊 TTS starting: \"\(String(text.prefix(80)))...\"")
     
-    // Truncate very long responses
-    let spokenText = text.count > 500 ? String(text.prefix(500)) + "。後面還有更多內容" : text
+    // Truncate for snappy voice UX (shorter = faster TTS + shorter playback)
+    let spokenText = text.count > 200 ? String(text.prefix(200)) + "。" : text
     
     // Strip markdown formatting for cleaner speech
     let cleanText = spokenText
@@ -443,7 +443,7 @@ class DirectSessionViewModel: ObservableObject {
     transcript = ""
     
     if isAutoMode {
-      try? await Task.sleep(nanoseconds: 800_000_000)
+      try? await Task.sleep(nanoseconds: 300_000_000)  // 300ms (was 800ms)
       startListening()
     } else {
       state = .idle
@@ -468,8 +468,8 @@ class DirectSessionViewModel: ObservableObject {
       "model": "tts-1",
       "input": text,
       "voice": "nova",
-      "response_format": "mp3",
-      "speed": 1.1
+      "response_format": "aac",  // aac: native iOS support, smaller than mp3
+      "speed": 1.15  // slightly faster speech for snappier feel
     ]
     
     do {
@@ -506,9 +506,9 @@ class DirectSessionViewModel: ObservableObject {
         return nil
       }
       
-      // OpenAI returns raw MP3 audio directly
-      if data.count > 100 {
-        log("🔊 OpenAI TTS: got \(data.count) bytes MP3 audio")
+      // OpenAI returns raw audio data
+      if data.count > 50 {
+        log("🔊 OpenAI TTS: got \(data.count) bytes audio")
         return data
       }
       

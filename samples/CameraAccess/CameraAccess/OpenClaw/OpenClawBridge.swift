@@ -88,7 +88,7 @@ class OpenClawBridge: ObservableObject {
     [使用者透過眼鏡說]: \(task)
     [眼鏡攝影機畫面分析]: \(visionDescription)
     
-    請根據使用者說的話和眼前的畫面來回答。用簡短口語化的中文回覆（這會透過語音播放給使用者聽）。
+    ⚡ 語音模式：用最精簡的口語中文回覆，不超過2-3句話。不要用markdown格式。這是即時語音對話，要像朋友聊天一樣自然簡短。
     """
     NSLog("[OpenClaw] 📸 Using pre-emptive vision (%d chars), skipping inline Gemini call", visionDescription.count)
     return await sendToGateway(enrichedTask: enrichedTask, toolName: toolName)
@@ -99,8 +99,8 @@ class OpenClawBridge: ObservableObject {
     toolName: String = "execute",
     image: UIImage? = nil
   ) async -> ToolResult {
-    // Step 1: If image provided, analyze with Gemini Vision first (sequential fallback)
-    var enrichedTask = task
+    // Always add voice mode instruction for concise responses
+    var enrichedTask = task + "\n\n⚡ 語音模式：用最精簡的口語中文回覆，不超過2-3句話。不要用markdown格式。這是即時語音對話，要像朋友聊天一樣自然簡短。"
     if let image = image {
       NSLog("[OpenClaw] 📸 Image provided — analyzing with Gemini Vision (inline)...")
       let visionResult = await analyzeImageWithGemini(image: image, userSpeech: task)
@@ -109,7 +109,7 @@ class OpenClawBridge: ObservableObject {
         [使用者透過眼鏡說]: \(task)
         [眼鏡攝影機畫面分析]: \(description)
         
-        請根據使用者說的話和眼前的畫面來回答。用簡短口語化的中文回覆（這會透過語音播放給使用者聽）。
+        ⚡ 語音模式：用最精簡的口語中文回覆，不超過2-3句話。不要用markdown格式。這是即時語音對話，要像朋友聊天一樣自然簡短。
         """
         NSLog("[OpenClaw] 📸 Vision analysis done (%d chars)", description.count)
       } else {
